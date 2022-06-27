@@ -1,14 +1,15 @@
 import datetime
 import json
+from pathlib import Path
 from click.testing import CliRunner
 from spatula.cli import cli
 
 
 def test_shell_command():
     runner = CliRunner()
-    result = runner.invoke(cli, ["shell", "https://example.com"])
+    result = runner.invoke(cli, ["shell", "https://httpbin.org/get"])
     assert result.exit_code == 0
-    assert "url: https://example.com" in result.output
+    assert "url: https://httpbin.org/get" in result.output
     assert "resp: " in result.output
     assert "root: " in result.output
 
@@ -29,6 +30,18 @@ def test_scrape_command_basic():
         assert f"success: wrote 5 objects to _scrapes/{today}/002" in result.output
 
 
+def test_scrape_command_module():
+    runner = CliRunner()
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+
+    # scrapes 10 items because it runs both test ListPages
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli, ["scrape", "tests.examples"])
+        assert result.exit_code == 0
+        assert f"success: wrote 10 objects to _scrapes/{today}/001" in result.output
+
+
 def test_scrape_command_output_dir_flag():
     runner = CliRunner()
 
@@ -44,6 +57,29 @@ def test_scrape_command_output_dir_flag():
         )
         assert result.exit_code == 1
         assert "mydir exists and is not empty" in result.output
+
+
+def test_scrape_command_source_flag():
+    runner = CliRunner()
+    today = datetime.date.today().strftime("%Y-%m-%d")
+
+    with runner.isolated_filesystem():
+        # tests source override
+        result = runner.invoke(
+            cli,
+            [
+                "scrape",
+                "tests.examples.ExamplePage",
+                "--source",
+                "https://httpbin.org/get",
+            ],
+        )
+        assert result.exit_code == 0
+
+        assert f"success: wrote 1 objects to _scrapes/{today}/001" in result.output
+        files = list(Path(f"_scrapes/{today}/001").glob("*"))
+        with open(files[0]) as f:
+            assert "https://httpbin.org" in f.read()
 
 
 def test_scout_command_basic():
@@ -113,7 +149,7 @@ def test_test_command_paginated():
     result = runner.invoke(cli, ["test", "tests.examples.ExamplePaginatedPage"])
     assert result.exit_code == 0
     assert (
-        "paginating for ExamplePaginatedPage source=https://example.com"
+        "paginating for ExamplePaginatedPage source=https://httpbin.org"
         in result.output
     )
     # make sure the 6th item is present and numbered correctly
@@ -128,12 +164,23 @@ def test_test_command_no_pagination():
     )
     assert result.exit_code == 0
     assert (
-        "pagination disabled: would paginate for ExamplePaginatedPage source=https://example.com"
+        "pagination disabled: would paginate for ExamplePaginatedPage source=https://httpbin.org/get"
         in result.output
     )
     # make sure the 6th item is present and numbered correctly
     assert len(result.output.splitlines()) == 4
     assert "6: " not in result.output
+
+
+def test_test_command_subpages():
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["test", "tests.examples.ExampleListPageSubpages"])
+    assert result.exit_code == 0
+    assert (
+        "would continue with Subpage(input={'val': '5'} source=NullSource)"
+        in result.output
+    )
 
 
 def test_test_command_input():

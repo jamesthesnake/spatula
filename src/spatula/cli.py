@@ -2,21 +2,24 @@ import dataclasses
 import datetime
 import functools
 import importlib
+import inspect
 import json
 import logging
 import sys
 import typing
 import uuid
+import shutil
 from pathlib import Path
+from types import ModuleType
 import lxml.html  # type: ignore
 import click
 from scrapelib import Scraper, SQLiteCache
 from .utils import _display, _obj_to_dict, attr_has, attr_fields
 from .sources import URL, Source
-from .pages import Page
+from .pages import Page, ListPage
 
 
-VERSION = "0.7.1"
+VERSION = "0.9.0"
 
 
 def scraper_params(func: typing.Callable) -> typing.Callable:
@@ -81,21 +84,21 @@ def scraper_params(func: typing.Callable) -> typing.Callable:
         )
         scraper.timeout = timeout
         scraper.user_agent = user_agent
-        # double ignore, weird issue on 3.7?
-        scraper.headers = {  # type: ignore
-            k.strip(): v.strip() for k, v in [h.split(":") for h in header]
-        }  # type: ignore
+        # only update headers, don't overwrite defaults
+        scraper.headers.update(
+            {k.strip(): v.strip() for k, v in [h.split(":") for h in header]}
+        )
         if fastmode:
             scraper.cache_storage = SQLiteCache("spatula-cache.db")
             scraper.cache_write_only = False
 
         if verbosity == -1:
             level = logging.INFO if func.__name__ != "test" else logging.DEBUG
-        elif verbosity == 0:
+        elif verbosity == 0:  # pragma: no cover
             level = logging.ERROR
-        elif verbosity == 1:
+        elif verbosity == 1:  # pragma: no cover
             level = logging.INFO
-        elif verbosity >= 2:
+        elif verbosity >= 2:  # pragma: no cover
             level = logging.DEBUG
 
         if verbosity < 3:
@@ -109,24 +112,68 @@ def scraper_params(func: typing.Callable) -> typing.Callable:
     return newfunc
 
 
-def get_page_class(dotted_name: str) -> type:
-    mod_name, cls_name = dotted_name.rsplit(".", 1)
+def import_mod(name: str) -> typing.Union[ModuleType, type]:
     try:
-        mod = importlib.import_module(mod_name)
+        return importlib.import_module(name)
     except ImportError:
+        # no need to try again
+        if "." in sys.path:
+            raise
         logging.getLogger("spatula").debug("appending current directory to PYTHONPATH")
         sys.path.append(".")
-        mod = importlib.import_module(mod_name)
+        return importlib.import_module(name)
+
+
+def get_page_class(dotted_name: str) -> type:
+    mod_name, cls_name = dotted_name.rsplit(".", 1)
+    mod = import_mod(mod_name)
     Cls = getattr(mod, cls_name)
     return Cls
 
 
-def get_page(dotted_name: str) -> Page:
-    Cls = get_page_class(dotted_name)
-    if isinstance(Cls, Page):
-        return Cls
-    else:
-        return Cls()
+def get_dump_function(
+    dotted_name: str,
+) -> typing.Callable[[typing.Optional[dict], typing.IO], None]:
+    mod_name, func_name = dotted_name.rsplit(".", 1)
+    mod = import_mod(mod_name)
+    func = getattr(mod, func_name)
+    return func
+
+
+def get_pages_from_module(dotted_name: str) -> typing.List[type]:
+    mod = import_mod(dotted_name)
+    pages = set()
+    base_pages = set()
+    for name, member in inspect.getmembers(mod):
+        try:
+            if issubclass(member, ListPage):
+                pages.add(member)
+                base_pages.update(member.__mro__[1:])
+        except TypeError:
+            pass
+    return list(pages - base_pages)
+
+
+def get_pages(dotted_name: str, source: typing.Optional[str]) -> typing.List[Page]:
+    try:
+        pages = [Cls() for Cls in get_pages_from_module(dotted_name)]
+        if pages:
+            logging.getLogger("spatula").debug(f"found pages: {pages}")
+            return pages
+        else:
+            logging.getLogger("spatula").error(
+                f"found no list pages in module {dotted_name}"
+            )
+            sys.exit(1)
+    except ImportError:
+        # single page
+        Cls = get_page_class(dotted_name)
+        if isinstance(Cls, Page):
+            if source:
+                Cls.source = URL(source)
+            return [Cls]
+        else:
+            return [Cls(source=source)]
 
 
 def get_new_filename(obj: typing.Any) -> str:
@@ -134,13 +181,6 @@ def get_new_filename(obj: typing.Any) -> str:
         return obj.get_filename()
     else:
         return str(uuid.uuid4())
-
-
-def save_object(obj: typing.Any, output_path: Path) -> None:
-    filename = output_path / (get_new_filename(obj) + ".json")
-    data = _obj_to_dict(obj)
-    with open(filename, "w") as f:
-        json.dump(data, f)
 
 
 @click.group()
@@ -185,16 +225,21 @@ def _get_fake_input(Cls: type, data: typing.List[str], interactive: bool) -> typ
         k, v = item.split("=", 1)
         fake_input[k] = v
 
-    input_type = getattr(Cls, "input_type", None)
-
     if hasattr(Cls, "example_input"):
-        return getattr(Cls, "example_input")
+        example = getattr(Cls, "example_input")
+        for k, v in fake_input.items():
+            if isinstance(example, dict):
+                example[k] = v
+            else:
+                setattr(example, k, v)
+        return example
 
+    input_type = getattr(Cls, "input_type", None)
     if input_type:
         click.secho(f"{Cls.__name__} expects input ({input_type.__name__}): ")
         if dataclasses.is_dataclass(input_type):
             fields = dataclasses.fields(input_type)
-        elif attr_has(input_type):
+        elif attr_has(input_type):  # pragma: no cover
             # ignore type rules here since dataclasses/attr do not share a base
             # but fields will have a name no matter what
             fields = attr_fields(input_type)  # type: ignore
@@ -217,7 +262,7 @@ def _get_fake_input(Cls: type, data: typing.List[str], interactive: bool) -> typ
 @click.option(
     "--interactive/--no-interactive",
     default=False,
-    help="Interactively prompt for missing data.",
+    help="Interactively prompt for missing data. (Default: false)",
 )
 @click.option(
     "-d", "--data", multiple=True, help="Provide input data in name=value pairs."
@@ -227,15 +272,21 @@ def _get_fake_input(Cls: type, data: typing.List[str], interactive: bool) -> typ
     "--pagination/--no-pagination",
     default=True,
     help="Determine whether or not pagination should be followed or one page is "
-    "enough for testing",
+    "enough for testing. (Default: true)",
+)
+@click.option(
+    "--subpages/--no-subpages",
+    default=False,
+    help="Determine whether subpages should be scraped. (Default: false)",
 )
 @scraper_params
 def test(
     class_name: str,
     interactive: bool,
     data: typing.List[str],
-    source: str,
+    source: typing.Optional[str],
     pagination: bool,
+    subpages: bool,
     scraper: Scraper,
 ) -> None:
     """
@@ -268,41 +319,55 @@ def test(
     if not source_obj and hasattr(Cls, "example_source"):
         source_obj = Cls.example_source  # type: ignore
 
-    # we need to do the request-response-next-page loop at least once
-    once = True
-    num_items = 0
-    while source_obj or once:
-        once = False
-        page = Cls(fake_input, source=source_obj)
+    if subpages:
+        initial_page = Cls(fake_input, source=source_obj)
+        for n, item in enumerate(initial_page._to_items(scraper)):
+            click.echo(click.style(f"{n+1}: ", fg="green") + _display(item))
+    else:
+        # a custom loop instead of _to_items so we can avoid subpages
+        # we need to do the request-response-next-page loop at least once
+        once = True
+        num_items = 0
+        while source_obj or once:
+            once = False
+            page = Cls(fake_input, source=source_obj)
 
-        # fetch data after input is handled, since we might need to build the source
-        page._fetch_data(scraper)
+            # fetch data after input is handled, since we might need to build the source
+            page._fetch_data(scraper)
 
-        result = page.process_page()
+            result = page.process_page()
 
-        if isinstance(result, typing.Generator):
-            for item in result:
-                # use this count instead of enumerate to handle pagination
-                num_items += 1
-                click.echo(click.style(f"{num_items}: ", fg="green") + _display(item))
-        else:
-            click.secho(_display(result))
-
-        # will be None in most cases, existing the loop, otherwise we restart
-        source_obj = page.get_next_source()
-        if source_obj:
-            if pagination:
-                click.secho(
-                    f"paginating for {page.__class__.__name__} source={source_obj}",
-                    fg="blue",
-                )
+            if isinstance(result, typing.Generator):
+                for item in result:
+                    # use this count instead of enumerate to handle pagination
+                    num_items += 1
+                    if isinstance(item, Page):
+                        click.echo(
+                            click.style(f"{num_items}: would continue with ", fg="blue")
+                            + _display(item)
+                        )
+                    else:
+                        click.echo(
+                            click.style(f"{num_items}: ", fg="green") + _display(item)
+                        )
             else:
-                click.secho(
-                    "pagination disabled: would paginate for "
-                    f"{page.__class__.__name__} source={source_obj}",
-                    fg="yellow",
-                )
-                break
+                click.secho(_display(result))
+
+            # will be None in most cases, existing the loop, otherwise we restart
+            source_obj = page.get_next_source()
+            if source_obj:
+                if pagination:
+                    click.secho(
+                        f"paginating for {page.__class__.__name__} source={source_obj}",
+                        fg="blue",
+                    )
+                else:
+                    click.secho(
+                        "pagination disabled: would paginate for "
+                        f"{page.__class__.__name__} source={source_obj}",
+                        fg="yellow",
+                    )
+                    break
 
 
 @cli.command()
@@ -310,12 +375,24 @@ def test(
 @click.option(
     "-o", "--output-dir", default=None, help="override default output directory."
 )
+@click.option(
+    "--rmdir/--no-rmdir", default=False, help="remove output directory before scrape."
+)
+@click.option("-s", "--source", help="Provide (or override) source URL")
+@click.option("--dump", help="Specify dump function", default="json.dump")
 @scraper_params
-def scrape(initial_page_name: str, output_dir: str, scraper: Scraper) -> None:
+def scrape(
+    initial_page_name: str,
+    output_dir: str,
+    rmdir: bool,
+    source: typing.Optional[str],
+    scraper: Scraper,
+    dump: str,
+) -> None:
     """
     Run full scrape, and output data to disk.
     """
-    initial_page = get_page(initial_page_name)
+    # ensure output directory is ready
     if not output_dir:
         dirn = 1
         today = datetime.date.today().strftime("%Y-%m-%d")
@@ -332,17 +409,31 @@ def scrape(initial_page_name: str, output_dir: str, scraper: Scraper) -> None:
             output_path.mkdir(parents=True)
         except FileExistsError:
             if len(list(output_path.iterdir())):
-                click.secho(f"{output_dir} exists and is not empty", fg="red")
-                sys.exit(1)
+                if rmdir:
+                    click.secho(f"{output_dir} exists and was cleared", fg="red")
+                    shutil.rmtree(output_dir)
+                    output_path.mkdir(parents=True)
+                else:
+                    click.secho(f"{output_dir} exists and is not empty", fg="red")
+                    sys.exit(1)
+
+    dump_func = get_dump_function(dump)
+    # actually do the scrape
     count = 0
-    for item in initial_page._to_items(scraper):
-        save_object(item, output_path)
-        count += 1
+    pages = get_pages(initial_page_name, source)
+    for initial_page in pages:
+        for item in initial_page._to_items(scraper):
+            filename = output_path / (get_new_filename(item) + ".json")
+            data = _obj_to_dict(item)
+            with open(filename, "w") as f:
+                dump_func(data, f)
+            count += 1
     click.secho(f"success: wrote {count} objects to {output_path}", fg="green")
 
 
 @cli.command()
 @click.argument("initial_page_name")
+@click.option("-s", "--source", help="Provide (or override) source URL")
 @click.option(
     "-o",
     "--output-file",
@@ -350,7 +441,12 @@ def scrape(initial_page_name: str, output_dir: str, scraper: Scraper) -> None:
     help="override default output file [default: scout.json].",
 )
 @scraper_params
-def scout(initial_page_name: str, output_file: str, scraper: Scraper) -> None:
+def scout(
+    initial_page_name: str,
+    output_file: str,
+    source: typing.Optional[str],
+    scraper: Scraper,
+) -> None:
     """
     Run first step of scrape & output data to a JSON file.
 
@@ -363,8 +459,10 @@ def scout(initial_page_name: str, output_file: str, scraper: Scraper) -> None:
     (typically a ListPage derivative) surfacing enough information (perhaps a
     last_updated date) to know whether any of the other pages have been scraped.
     """
-    initial_page = get_page(initial_page_name)
-    items = list(initial_page._to_items(scraper, scout=True))
+    initial_pages = get_pages(initial_page_name, source)
+    items: typing.List[typing.Any] = []
+    for initial_page in initial_pages:
+        items.extend(initial_page._to_items(scraper, scout=True))
     with open(output_file, "w") as f:
         json.dump(items, f, indent=2)
     click.secho(f"success: wrote {len(items)} records to {output_file}", fg="green")

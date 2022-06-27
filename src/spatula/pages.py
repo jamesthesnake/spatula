@@ -1,12 +1,16 @@
 import io
 import csv
+import time
 import tempfile
 import subprocess
 import logging
+import warnings
 import typing
+import requests
 import scrapelib
 import lxml.html  # type: ignore
 from openpyxl import load_workbook  # type: ignore
+from . import config
 from .sources import Source, URL
 from .utils import _obj_to_dict
 
@@ -25,6 +29,33 @@ def _to_scout_result(result: typing.Any) -> typing.Dict[str, typing.Any]:
     }
 
 
+class SkipItem(Exception):
+    """
+    To be raised to skip processing of the current item & continue with the next item.
+
+    Example:
+    ``` python
+    class SomeListPage(HtmlListPage):
+        def process_item(self, item):
+            if item.name == "Vacant":
+                raise SkipItem("vacant")
+            # do normal processing here
+    ```
+
+    Or, if the skip logic needs to live within a detail Page:
+    ``` python
+    class SomeDetailPage(HtmlPage):
+        def process_page(self):
+            if self.input.name == "Vacant":
+                raise SkipItem("vacant")
+            # do normal processing here
+    ```
+    """
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+
 class MissingSourceError(Exception):
     def __init__(self, msg: str):
         super().__init__(msg)
@@ -35,9 +66,20 @@ class HandledError(Exception):
         super().__init__(exc)
 
 
+class RejectedResponse(Exception):
+    def __init__(self, retries: int, response: requests.Response):
+        self.response = response
+        super().__init__(
+            f"Response was rejected ({retries}x) by accept_response: {response}"
+        )
+
+
 class Page:
     """
     Base class for all *Page* scrapers, used for scraping information from a single type of page.
+
+    For details on how these methods are called, it may be helpful to read
+    [Anatomy of a Scrape](anatomy-of-a-scrape.md).
 
     **Attributes**
 
@@ -64,16 +106,30 @@ class Page:
     :   Instance of `input_type` to be used when invoking `spatula test`.
 
     `example_source`
-    :   Source to fetch when invokking `spatula test`.
+    :   Source to fetch when invoking `spatula test`.
 
     `dependencies`
-    :   TODO: document
+    :   Dictionary mapping of names to `Page` objects that will be available before `process_page`.
+
+        For example:
+        ``` python
+
+        class EmployeeDetail(HtmlPage):
+            dependencies = {"awards": AwardsPage()}
+        ```
+
+        Means that before `EmployeeDetail.process_page` is called, it is guaranteed to have the
+        output from `AwardsPage` available as `self.awards`.
+
+        See [Specifying Dependencies](advanced-techniques.md#specifying-dependencies) for
+        a more detailed explanation.
 
     **Methods**
     """
 
     source: typing.Union[None, str, Source] = None
     dependencies: typing.Dict[str, "Page"] = {}
+    _cached_dependencies: typing.Dict[str, typing.Any] = {}
 
     def _fetch_data(self, scraper: scrapelib.Scraper) -> None:
         """
@@ -81,11 +137,21 @@ class Page:
         exactly once before process_page is invoked
         """
         # process dependencies first
-        for val, dep in self.dependencies.items():
+        for key, dep in self.dependencies.items():
+            use_cache = False
             if isinstance(dep, type):
                 dep = dep(self.input)
-            dep._fetch_data(scraper)
-            setattr(self, val, dep.process_page())
+            else:
+                use_cache = True
+
+            if key in self._cached_dependencies:
+                setattr(self, key, self._cached_dependencies[key])
+            else:
+                dep._fetch_data(scraper)
+                page_result = dep.process_page()
+                setattr(self, key, page_result)
+                if use_cache:
+                    self._cached_dependencies[key] = page_result
 
         if not self.source:
             try:
@@ -98,15 +164,41 @@ class Page:
             self.source = URL(self.source)
         # at this point self.source is indeed a Source
         self.logger.info(f"fetching {self.source}")
-        try:
-            self.response = self.source.get_response(scraper)  # type: ignore
-            if getattr(self.response, "fromcache", None):
-                self.logger.debug(f"retrieved {self.source} from cache")
-        except scrapelib.HTTPError as e:
-            self.process_error_response(e)
-            raise HandledError(e)
-        else:
-            self.postprocess_response()
+        total_attempts = attempts_remaining = (self.source.retries or config.REJECTED_RESPONSE_RETRIES) + 1  # type: ignore
+        while attempts_remaining:
+            attempts_remaining -= 1
+            try:
+                response = self.source.get_response(scraper)  # type: ignore
+                if getattr(response, "fromcache", None):
+                    self.logger.debug(f"retrieved {self.source} from cache")
+                if self.accept_response(response):
+                    self.response = response
+                elif attempts_remaining:
+                    self.logger.debug(
+                        f"response rejected, {attempts_remaining}/{total_attempts} attempts remaining, sleeping {config.RETRY_WAIT_SECONDS}s..."
+                    )
+                    time.sleep(config.RETRY_WAIT_SECONDS)
+                    continue
+                else:
+                    self.logger.debug(
+                        f"response rejected, 0/{total_attempts} attempts remaining"
+                    )
+                    raise RejectedResponse(total_attempts, response)
+            except scrapelib.HTTPError as e:
+                self.process_error_response(e)
+                raise HandledError(e)
+            else:
+                self.postprocess_response()
+                break
+
+    def _paginate(
+        self, scraper: scrapelib.Scraper, scout: bool
+    ) -> typing.Iterable[typing.Any]:
+        next_source = self.get_next_source()
+        if next_source:
+            # instantiate the same class with same input, but increment the source
+            next_page = type(self)(self.input, source=next_source)
+            yield from next_page._to_items(scraper, scout=scout)
 
     def _to_items(
         self, scraper: scrapelib.Scraper, *, scout: bool = False
@@ -115,8 +207,16 @@ class Page:
         try:
             self._fetch_data(scraper)
         except HandledError:
+            # ok to proceed, but nothing left to do with this page
+            yield from self._paginate(scraper, scout)
             return
-        result = self.process_page()
+        try:
+            result = self.process_page()
+        except SkipItem as e:
+            # a detail page can raise SkipItem, which means no further processing of
+            # that detail page (as there is no result)
+            self.logger.info(f"SkipItem: {e}")
+            return
 
         # if we got back a generator, we need to process each result
         if isinstance(result, typing.Generator):
@@ -128,13 +228,6 @@ class Page:
                     yield from item._to_items(scraper)
                 else:
                     yield item
-
-            # after handling a list, check for pagination
-            next_source = self.get_next_source()
-            if next_source:
-                # instantiate the same class with same input, but increment the source
-                next_page = type(self)(self.input, source=next_source)
-                yield from next_page._to_items(scraper, scout=scout)
         elif scout:
             yield _to_scout_result(result)
         elif isinstance(result, Page):
@@ -143,6 +236,9 @@ class Page:
         else:
             # end-result, just return as-is
             yield result
+
+        # check for next page
+        yield from self._paginate(scraper, scout)
 
     def __init__(
         self,
@@ -203,6 +299,9 @@ class Page:
         This is called after source.get_response if an exception is raised.
         """
         raise exception
+
+    def accept_response(self, response: requests.Response) -> bool:
+        return True
 
     def process_page(self) -> typing.Any:
         """
@@ -323,17 +422,12 @@ class ListPage(Page):
     **Methods**
     """
 
-    class SkipItem(Exception):
-        def __init__(self, msg: str):
-            super().__init__(msg)
-
-    def skip(self, msg: str = "") -> None:
-        """
-        Can be called from within `process_item` to skip a given item.
-
-        Typically used if there is some known bad data.
-        """
-        raise self.SkipItem(msg)
+    def skip(self, msg: str = "") -> None:  # pragma: no cover
+        warnings.warn(
+            "self.skip is deprecated and will be removed in 0.9, raise SkipItem instead",
+            DeprecationWarning,
+        )
+        raise SkipItem(msg)
 
     def _process_or_skip_loop(
         self, iterable: typing.Iterable
@@ -341,8 +435,8 @@ class ListPage(Page):
         for item in iterable:
             try:
                 item = self.process_item(item)
-            except self.SkipItem as e:
-                self.logger.debug(f"SkipItem: {e}")
+            except SkipItem as e:
+                self.logger.info(f"SkipItem: {e}")
                 continue
             yield item
 
@@ -351,7 +445,13 @@ class ListPage(Page):
         To be overridden.
 
         Called once per subitem on page, as defined by the particular subclass being used.
+
+        Should return data extracted from the `item`.
+
+        If [`SkipItem`](#SkipItem) is raised, `process_item` will continue to be called with
+        the next item in the stream.
         """
+        warnings.warn(f"process_item not overridden on {self.__class__.__name__}")
         return item
 
 
@@ -368,7 +468,7 @@ class CsvListPage(ListPage):
         yield from self._process_or_skip_loop(self.reader)
 
 
-class ExcelListPage(ListPage):
+class ExcelListPage(ListPage):  # pragma: no cover
     """
     Processes each row in an Excel file as an item with `process_item`.
     """

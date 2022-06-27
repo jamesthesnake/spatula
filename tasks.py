@@ -34,7 +34,7 @@ def spellcheck(c):
 @task(lint, mypy, test)
 def release(c, old, new):
     c.run(
-        "poetry run bump2version src/spatula/cli.py pyproject.toml docs/cli.md "
+        "poetry run bump2version x src/spatula/cli.py pyproject.toml docs/cli.md "
         f"--current-version {old} --new-version {new} --commit --tag --allow-dirty",
         pty=True,
     )
@@ -42,3 +42,4 @@ def release(c, old, new):
     c.run("git push --tags", pty=True)
     c.run("poetry publish --build", pty=True)
     c.run("poetry run mkdocs gh-deploy", pty=True)
+    c.run(f"gh release create v{new} -F docs/changelog.md")
