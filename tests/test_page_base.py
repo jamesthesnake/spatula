@@ -1,7 +1,17 @@
 import logging
 import pytest
-from spatula import Page, MissingSourceError, HandledError, NullSource
+from spatula import (
+    Page,
+    ListPage,
+    MissingSourceError,
+    HandledError,
+    NullSource,
+    SkipItem,
+    RejectedResponse,
+    config,
+)
 from scrapelib import HTTPError, Scraper
+from .examples import ExamplePaginatedPage
 
 SOURCE = "https://example.com"
 
@@ -93,6 +103,46 @@ def test_fetch_data_handle_error_response():
     assert p._error_was_called
 
 
+class RetrySource:
+    """fake source that returns a response after being called 3 times"""
+
+    called = 0
+
+    def __init__(self, retries):
+        self.retries = retries
+
+    def get_response(self, scraper):
+        self.called += 1
+        if self.called < 3:
+            return scraper.request("http://failure")
+        else:
+            return scraper.request("http://retried")
+
+
+class RetryPage(Page):
+    """retry as long as 'failure' is in response"""
+
+    config.RETRY_WAIT_SECONDS = 0.1
+
+    def accept_response(self, response):
+        return "failure" not in response
+
+
+def test_retry_success():
+    config.RETRY_WAIT_SECONDS = 0.1
+    p = RetryPage(source=RetrySource(retries=2))
+    p._fetch_data(DummyScraper())
+    assert p.response == "dummy response for http://retried"
+
+
+def test_retry_still_fails():
+    config.RETRY_WAIT_SECONDS = 0.1
+    p = RetryPage(source=RetrySource(retries=1))
+    with pytest.raises(RejectedResponse) as e:
+        p._fetch_data(DummyScraper())
+        assert "2x" in str(e)
+
+
 def test_fetch_data_postprocess():
     class Postprocess(Page):
         _postprocessed = False
@@ -155,3 +205,101 @@ def test_to_items_scout():
         "data": {"first": 3},
         "__next__": "SecondPage source=NullSource",
     }
+
+
+def test_paginated_page():
+    page = ExamplePaginatedPage()
+    items = list(page.do_scrape())
+    assert len(items) == 6
+
+
+def test_paginated_list_page():
+    page = ExamplePaginatedPage()
+    items = list(page.do_scrape())
+    assert len(items) == 6
+
+
+def test_paginated_single_value_page():
+    class SingleReturnPaginatedPage(Page):
+        source = NullSource()
+
+        def process_page(self):
+            return {"dummy": "value"}
+
+        def get_next_source(self):
+            # a hack to fake a second identical page
+            if isinstance(self.source, NullSource):
+                return "https://httpbin.org/get"
+
+    page = SingleReturnPaginatedPage()
+    items = list(page.do_scrape())
+    assert len(items) == 2
+
+
+def test_paginated_page_with_error():
+    BAD_URL = "https://httpbin.org/status/500"
+
+    class ErrorThenPaginatedPage(Page):
+        source = BAD_URL
+        error_handled = False
+
+        def process_page(self):
+            return {"dummy": "value"}
+
+        def process_error_response(self, exception):
+            self.error_handled = True
+
+        def get_next_source(self):
+            # a hack to fake a second identical page
+            if self.source.url == BAD_URL:
+                return "http://example.com"
+
+    page = ErrorThenPaginatedPage()
+    items = list(page.do_scrape())
+    assert len(items) == 1
+    assert page.error_handled
+
+
+def test_skip_item(caplog):
+    class SkipOddPage(ListPage):
+        source = NullSource()
+
+        def process_page(self):
+            yield from self._process_or_skip_loop([1, 2, 3, 4, 5])
+
+        def process_item(self, item):
+            if item % 2:
+                raise SkipItem(f"{item} is odd!")
+            else:
+                return item
+
+    page = SkipOddPage()
+    with caplog.at_level(logging.INFO):
+        items = list(page.do_scrape())
+    assert items == [2, 4]
+    # one for the fetch and 3 for the skips
+    assert len(caplog.records) == 4
+
+
+def test_skip_item_on_detail_page(caplog):
+    class SkipOddDetail(Page):
+        def process_page(self):
+            if self.input % 2:
+                raise SkipItem(f"{self.input} is odd!")
+            else:
+                return self.input
+
+    class SkipOddList(ListPage):
+        source = NullSource()
+
+        def process_page(self):
+            yield from self._process_or_skip_loop([1, 2, 3, 4, 5])
+
+        def process_item(self, item):
+            return SkipOddDetail(item, source=NullSource())
+
+    page = SkipOddList()
+    with caplog.at_level(logging.INFO):
+        items = list(page.do_scrape())
+    assert items == [2, 4]
+    assert len(caplog.records) == 9  # 6 null fetches, 3 skips
